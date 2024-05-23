@@ -91,9 +91,9 @@ class RelativeBucketedTimeAndPositionBasedBias(RelativeAttentionBiasModule):
         super().__init__()
 
         self._max_seq_len: int = max_seq_len
-        self._ts_w = torch.nn.Parameter(
-            torch.empty(num_buckets + 1).normal_(mean=0, std=0.02),
-        )
+        # self._ts_w = torch.nn.Parameter(
+            # torch.empty(num_buckets + 1).normal_(mean=0, std=0.02),
+        # )
         self._pos_w = torch.nn.Parameter(
             torch.empty(2 * max_seq_len - 1).normal_(mean=0, std=0.02),
         )
@@ -115,18 +115,19 @@ class RelativeBucketedTimeAndPositionBasedBias(RelativeAttentionBiasModule):
         t = F.pad(self._pos_w[:2 * N - 1], [0, N]).repeat(N)
         t = t[..., :-N].reshape(1, N, 3 * N - 2)
         r = (2 * N - 1) // 2
+        rel_pos_bias = t[:, :, r:-r]
 
         # [B, N + 1] to simplify tensor manipulations.
-        ext_timestamps = torch.cat([all_timestamps, all_timestamps[:, N-1:N]], dim=1)
+        # ext_timestamps = torch.cat([all_timestamps, all_timestamps[:, N-1:N]], dim=1)
         # causal masking. Otherwise [:, :-1] - [:, 1:] works
-        bucketed_timestamps = torch.clamp(
-            self._bucketization_fn(ext_timestamps[:, 1:].unsqueeze(2) - ext_timestamps[:, :-1].unsqueeze(1)),
-            min=0,
-            max=self._num_buckets,
-        ).detach()
-        rel_pos_bias = t[:, :, r:-r]
-        rel_ts_bias = torch.index_select(self._ts_w, dim=0, index=bucketed_timestamps.view(-1)).view(B, N, N)
-        return rel_pos_bias + rel_ts_bias
+        # bucketed_timestamps = torch.clamp(
+            # self._bucketization_fn(ext_timestamps[:, 1:].unsqueeze(2) - ext_timestamps[:, :-1].unsqueeze(1)),
+            # min=0,
+            # max=self._num_buckets,
+        # ).detach()
+        # rel_ts_bias = torch.index_select(self._ts_w, dim=0, index=bucketed_timestamps.view(-1)).view(B, N, N)
+        return rel_pos_bias
+        # + rel_ts_bias
 
 
 HSTUCacheState = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]

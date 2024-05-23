@@ -320,6 +320,7 @@ class AmazonDataProcessor(DataProcessor):
         print(f"{self._prefix} #item ater filter: {len(set(ratings['item_id'].values))}")
 
         num_unique_items = len(set(ratings['item_id'].values))
+        ratings['timestamp'] = ratings['timestamp'].astype(int)
 
         # SASRec version
         ratings_group = ratings.sort_values(by=["timestamp"]).groupby("user_id")
@@ -385,4 +386,34 @@ def get_common_preprocessors():
         prefix="amzn_books",
         expected_num_unique_items=695762,
     )
-    return {"ml-1m": ml_1m_dp, "ml-20m": ml_20m_dp, "ml-1b": ml_1b_dp, "amzn-books": amzn_books_dp}
+    instruments_dp = AmazonDataProcessor(
+        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_2023/benchmark/5core/rating_only/Musical_Instruments.csv.gz",
+        "tmp/ratings_Musical_Instruments.csv.gz",
+        prefix="Musical_Instruments",
+        expected_num_unique_items=24587,
+    )
+    games_dp = AmazonDataProcessor(
+        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_2023/benchmark/5core/rating_only/Video_Games.csv.gz",
+        "tmp/ratings_Video_Games.csv.gz",
+        prefix="Video_Games",
+        expected_num_unique_items=25612,
+    )
+    baby_dp = AmazonDataProcessor(
+        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_2023/benchmark/5core/rating_only/Baby_Products.csv.gz",
+        "tmp/ratings_Baby_Products.csv.gz",
+        prefix="Baby_Products",
+        expected_num_unique_items=36013,
+    )
+    office_dp = AmazonDataProcessor(
+        "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_2023/benchmark/5core/rating_only/Office_Products.csv.gz",
+        "tmp/ratings_Office_Products.csv.gz",
+        prefix="Office_Products",
+        expected_num_unique_items=77551,
+    )
+    return {
+        "ml-1m": ml_1m_dp, "ml-20m": ml_20m_dp, "ml-1b": ml_1b_dp, "amzn-books": amzn_books_dp,
+        'Musical_Instruments': instruments_dp,
+        'Video_Games': games_dp,
+        'Baby_Products': baby_dp,
+        'Office_Products': office_dp
+    }

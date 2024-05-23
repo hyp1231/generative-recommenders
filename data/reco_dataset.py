@@ -17,6 +17,7 @@ import pandas as pd
 from typing import List
 
 import torch
+import torch.utils
 
 from data.dataset import DatasetV2
 from data.item_features import ItemFeatures
@@ -30,6 +31,7 @@ class RecoDataset:
     max_item_id: int
     all_item_ids: List[int]
     train_dataset: torch.utils.data.Dataset
+    val_dataset: torch.utils.data.Dataset
     eval_dataset: torch.utils.data.Dataset
 
 
@@ -70,10 +72,17 @@ def get_reco_dataset(
             chronological=chronological,
         )
     elif (
-        dataset_name == "amzn-books"
+        dataset_name in ["amzn-books", 'Musical_Instruments', 'Video_Games', 'Baby_Products', 'Office_Products']
     ):
         dp = get_common_preprocessors()[dataset_name]
         train_dataset = DatasetV2(
+            ratings_file=dp.output_format_csv(),
+            padding_length=max_sequence_length + 1,  # target
+            ignore_last_n=2,
+            shift_id_by=1,  # [0..n-1] -> [1..n]
+            chronological=chronological,
+        )
+        val_dataset = DatasetV2(
             ratings_file=dp.output_format_csv(),
             padding_length=max_sequence_length + 1,  # target
             ignore_last_n=1,
@@ -140,5 +149,6 @@ def get_reco_dataset(
         max_item_id=max_item_id,
         all_item_ids=all_item_ids,
         train_dataset=train_dataset,
+        val_dataset=val_dataset,
         eval_dataset=eval_dataset,
     )

@@ -131,12 +131,20 @@ def train_fn(
         shuffle=True,
         drop_last=world_size > 1,
     )
+    val_data_sampler, val_data_loader = create_data_loader(
+        dataset.val_dataset,
+        batch_size=eval_batch_size,
+        world_size=world_size,
+        rank=rank,
+        shuffle=False,  # needed for partial eval
+        drop_last=world_size > 1,
+    )
     eval_data_sampler, eval_data_loader = create_data_loader(
         dataset.eval_dataset,
         batch_size=eval_batch_size,
         world_size=world_size,
         rank=rank,
-        shuffle=True,  # needed for partial eval
+        shuffle=False,  # needed for partial eval
         drop_last=world_size > 1,
     )
 
@@ -183,6 +191,13 @@ def train_fn(
         output_postproc_module=output_postproc_module,
         verbose=True,
     )
+    print(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total number of parameters: {total_params}")
+    emb_params = sum(p.numel() for p in model._embedding_module.parameters())
+    print(f"#Parameters in Embeddings: {emb_params}")
+    print(f"#Non-embedding parameters: {total_params - emb_params}")
+
     model_debug_str = model.debug_str()
 
     # loss
@@ -263,11 +278,14 @@ def train_fn(
     torch.autograd.set_detect_anomaly(True)
 
     batch_id = 0
+    best_valid_score = -1
     for epoch in range(num_epochs):
         if train_data_sampler is not None:
             train_data_sampler.set_epoch(epoch)
         if eval_data_sampler is not None:
             eval_data_sampler.set_epoch(epoch)
+        if val_data_sampler is not None:
+            val_data_sampler.set_epoch(epoch)
         model.train()
         for row in iter(train_data_loader):
             seq_features, target_ids, target_ratings = movielens_seq_features_from_row(
@@ -303,10 +321,12 @@ def train_fn(
                 add_to_summary_writer(writer, batch_id, eval_dict, prefix="eval", world_size=world_size)
                 logging.info(
                     f"rank {rank}:  batch-stat (eval): iter {batch_id} (epoch {epoch}): " +
-                    f"NDCG@10 {_avg(eval_dict['ndcg@10'], world_size):.4f}, "
-                    f"HR@10 {_avg(eval_dict['hr@10'], world_size):.4f}, "
-                    f"HR@50 {_avg(eval_dict['hr@50'], world_size):.4f}, " +
-                    f"MRR {_avg(eval_dict['mrr'], world_size):.4f} ")
+                    f"NDCG@5 {_avg(eval_dict['ndcg@5'], world_size):.6f}, "
+                    f"HR@5 {_avg(eval_dict['hr@5'], world_size):.6f}, "
+                    f"NDCG@10 {_avg(eval_dict['ndcg@10'], world_size):.6f}, "
+                    f"HR@10 {_avg(eval_dict['hr@10'], world_size):.6f}, "
+                    f"HR@50 {_avg(eval_dict['hr@50'], world_size):.6f}, " +
+                    f"MRR {_avg(eval_dict['mrr'], world_size):.6f} ")
                 model.train()
 
             # TODO: consider separating this out?
@@ -375,10 +395,66 @@ def train_fn(
         def is_full_eval(epoch: int) -> bool:
             return (epoch % full_eval_every_n) == 0
 
-        # eval per epoch
+        # validation
         eval_dict_all = None
         eval_start_time = time.time()
         model.eval()
+        eval_state = get_eval_state(
+            model=model.module,
+            all_item_ids=dataset.all_item_ids,
+            negatives_sampler=negatives_sampler,
+            top_k_module_fn=lambda item_embeddings, item_ids: get_top_k_module(
+                top_k_method=top_k_method,
+                model=model.module,
+                item_embeddings=item_embeddings,
+                item_ids=item_ids,
+            ),
+            device=device,
+            float_dtype=torch.bfloat16 if main_module_bf16 else None,
+        )
+        for eval_iter, row in enumerate(iter(val_data_loader)):
+            seq_features, target_ids, target_ratings = movielens_seq_features_from_row(row, device=device, max_output_length=gr_output_length + 1)
+            eval_dict = eval_metrics_v2_from_tensors(
+                eval_state, model.module, seq_features, target_ids=target_ids, target_ratings=target_ratings,
+                user_max_batch_size=eval_user_max_batch_size,
+                dtype=torch.bfloat16 if main_module_bf16 else None,
+            )
+
+            if eval_dict_all is None:
+                eval_dict_all = {}
+                for k, v in eval_dict.items():
+                    eval_dict_all[k] = []
+
+            for k, v in eval_dict.items():
+                eval_dict_all[k] = eval_dict_all[k] + [v]
+            del eval_dict
+
+            # if (eval_iter + 1 >= partial_eval_num_iters) and (not is_full_eval(epoch)):
+                # logging.info(f"Truncating epoch {epoch} eval to {eval_iter + 1} iters to save cost..")
+                # break
+
+        for k, v in eval_dict_all.items():
+            eval_dict_all[k] = torch.cat(v, dim=-1)
+
+        ndcg_5 = _avg(eval_dict_all["ndcg@5"], world_size=world_size)
+        ndcg_10 = _avg(eval_dict_all["ndcg@10"], world_size=world_size)
+        ndcg_50 = _avg(eval_dict_all["ndcg@50"], world_size=world_size)
+        hr_5 = _avg(eval_dict_all["hr@5"], world_size=world_size)
+        hr_10 = _avg(eval_dict_all["hr@10"], world_size=world_size)
+        hr_50 = _avg(eval_dict_all["hr@50"], world_size=world_size)
+        mrr = _avg(eval_dict_all["mrr"], world_size=world_size)
+        valid_score = ndcg_10
+
+        add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch", world_size=world_size)
+        if full_eval_every_n > 1 and is_full_eval(epoch):
+            add_to_summary_writer(writer, batch_id=epoch, metrics=eval_dict_all, prefix="eval_epoch_full", world_size=world_size)
+
+        logging.info(f"rank {rank}: validation @ epoch {epoch} in {time.time() - eval_start_time:.2f}s: "
+                     f"NDCG@5 {ndcg_5:.6f}, NDCG@10 {ndcg_10:.6f}, NDCG@50 {ndcg_50:.6f}, HR@5 {hr_5:.6f}, HR@10 {hr_10:.6f}, HR@50 {hr_50:.6f}, MRR {mrr:.6f}")
+
+        # eval per epoch - test
+        eval_dict_all = None
+        eval_start_time = time.time()
         eval_state = get_eval_state(
             model=model.module,
             all_item_ids=dataset.all_item_ids,
@@ -409,15 +485,17 @@ def train_fn(
                 eval_dict_all[k] = eval_dict_all[k] + [v]
             del eval_dict
 
-            if (eval_iter + 1 >= partial_eval_num_iters) and (not is_full_eval(epoch)):
-                logging.info(f"Truncating epoch {epoch} eval to {eval_iter + 1} iters to save cost..")
-                break
+            # if (eval_iter + 1 >= partial_eval_num_iters) and (not is_full_eval(epoch)):
+                # logging.info(f"Truncating epoch {epoch} eval to {eval_iter + 1} iters to save cost..")
+                # break
 
         for k, v in eval_dict_all.items():
             eval_dict_all[k] = torch.cat(v, dim=-1)
 
+        ndcg_5 = _avg(eval_dict_all["ndcg@5"], world_size=world_size)
         ndcg_10 = _avg(eval_dict_all["ndcg@10"], world_size=world_size)
         ndcg_50 = _avg(eval_dict_all["ndcg@50"], world_size=world_size)
+        hr_5 = _avg(eval_dict_all["hr@5"], world_size=world_size)
         hr_10 = _avg(eval_dict_all["hr@10"], world_size=world_size)
         hr_50 = _avg(eval_dict_all["hr@50"], world_size=world_size)
         mrr = _avg(eval_dict_all["mrr"], world_size=world_size)
@@ -432,8 +510,11 @@ def train_fn(
                 'optimizer_state_dict': opt.state_dict(),
             }, f"./ckpts/{model_desc}_ep{epoch}")
 
-        logging.info(f"rank {rank}: eval @ epoch {epoch} in {time.time() - eval_start_time:.2f}s: "
-                     f"NDCG@10 {ndcg_10:.4f}, NDCG@50 {ndcg_50:.4f}, HR@10 {hr_10:.4f}, HR@50 {hr_50:.4f}, MRR {mrr:.4f}")
+        logging.info(f"rank {rank}: test @ epoch {epoch} in {time.time() - eval_start_time:.2f}s: "
+                     f"NDCG@5 {ndcg_5:.6f}, NDCG@10 {ndcg_10:.6f}, NDCG@50 {ndcg_50:.6f}, HR@5 {hr_5:.6f}, HR@10 {hr_10:.6f}, HR@50 {hr_50:.6f}, MRR {mrr:.6f}")
+        if valid_score > best_valid_score:
+            best_valid_score = valid_score
+            test_score = (hr_5, hr_10, ndcg_5, ndcg_10)
         last_training_time = time.time()
 
     if rank == 0:
@@ -448,6 +529,8 @@ def train_fn(
         }, f"./ckpts/{model_desc}_ep{epoch}")
 
     cleanup()
+    print('best valid:', best_valid_score)
+    print('test score:', test_score)
 
 
 def mp_train_fn(
@@ -472,6 +555,7 @@ def main(argv):
              args=(world_size, FLAGS.master_port, FLAGS.gin_config_file),
              nprocs=world_size,
              join=True)
+    # mp_train_fn(0, world_size, FLAGS.master_port, FLAGS.gin_config_file)
 
 
 if __name__ == "__main__":
